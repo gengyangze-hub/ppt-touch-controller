@@ -16,17 +16,18 @@ Key Windows API tricks:
 import ctypes
 from ctypes import wintypes
 from PySide6.QtCore import (
-    Qt, QTimer, QPoint, QSize, Signal, QEasingCurve,
-    QPropertyAnimation,
+    Qt, QTimer, QPoint, QPointF, QRectF, QSize, Signal,
+    QEasingCurve, QPropertyAnimation,
 )
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QBrush, QPainterPath, QFontMetrics,
-    QMouseEvent, QTouchEvent,
+    QMouseEvent, QTouchEvent, QCursor,
 )
 from PySide6.QtWidgets import (
     QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QLabel,
     QGraphicsOpacityEffect, QSizePolicy, QSlider, QDialog,
     QDialogButtonBox, QFormLayout, QComboBox, QSpinBox,
+    QApplication,
 )
 
 from settings_manager import SettingsManager
@@ -67,32 +68,18 @@ class MSG(ctypes.Structure):
 
 
 class TouchButton(QPushButton):
-    """Large touch-friendly circular button.
+    """Large touch-friendly circular button for slide navigation.
 
-    Features:
-    - Semi-transparent dark background with white arrow
-    - Long-press detection (500ms) for drag mode
-    - Visual feedback: scale up on press, highlight on long-press
+    Simple click-only button — no drag behavior. Drag is handled by
+    the separate DragHandle widget to prevent accidental repositioning
+    during rapid slide navigation.
     """
-
-    long_pressed = Signal()
-    drag_moved = Signal(QPoint)  # Emitted during drag (delta)
-
-    LONG_PRESS_MS = 500
 
     def __init__(self, text: str, size: int = 80, parent=None):
         super().__init__(text, parent)
         self._btn_size = size
         self.setFixedSize(size, size)
         self.setCursor(Qt.PointingHandCursor)
-
-        # Touch/long-press state
-        self._press_timer = QTimer(self)
-        self._press_timer.setSingleShot(True)
-        self._press_timer.timeout.connect(self._on_long_press)
-        self._long_press_active = False
-        self._is_dragging = False
-        self._press_start_pos = QPoint()
         self._opacity = 0.75
 
     def set_opacity(self, value: float) -> None:
@@ -101,31 +88,125 @@ class TouchButton(QPushButton):
         self.update()
 
     def paintEvent(self, event) -> None:
-        """Draw semi-transparent circular button with text."""
+        """Draw polished circular navigation button."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
         s = self._btn_size
-        margin = 3
-        r = (s - 2 * margin) / 2
         cx, cy = s / 2, s / 2
+        r = (s - 4) / 2  # Slightly smaller than full size for shadow margin
 
-        # Background circle
-        bg_alpha = int(self._opacity * 200)
-        if self._long_press_active:
-            bg_alpha = int(self._opacity * 255)  # Full opacity during drag
-            painter.setPen(QPen(QColor(255, 255, 255, 200), 4))
+        # Determine visual state
+        if self.isDown():
+            bg_alpha = int(self._opacity * 240)
+            border_alpha = 220
+            border_width = 4
+            text_alpha = 255
+        elif self.underMouse():
+            bg_alpha = int(self._opacity * 210)
+            border_alpha = 170
+            border_width = 3.5
+            text_alpha = 240
         else:
-            painter.setPen(QPen(QColor(255, 255, 255, 150), 3))
+            bg_alpha = int(self._opacity * 170)
+            border_alpha = 130
+            border_width = 3
+            text_alpha = int(self._opacity * 240)
 
-        painter.setBrush(QColor(0, 0, 0, bg_alpha))
-        painter.drawEllipse(QPoint(int(cx), int(cy)), int(r), int(r))
+        # Outer glow shadow
+        shadow = QColor(255, 255, 255, 30)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(shadow)
+        painter.drawEllipse(QPointF(cx, cy), r + 2, r + 2)
 
-        # Arrow text
-        font = QFont("Segoe UI", int(s * 0.35), QFont.Bold)
+        # Main circle
+        border_color = QColor(255, 255, 255, border_alpha)
+        painter.setPen(QPen(border_color, border_width))
+        painter.setBrush(QColor(20, 20, 20, bg_alpha))
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+
+        # Arrow text — bold, centered
+        font = QFont("Segoe UI", int(s * 0.38), QFont.Bold)
         painter.setFont(font)
-        painter.setPen(QColor(255, 255, 255, int(self._opacity * 255)))
+        painter.setPen(QColor(255, 255, 255, text_alpha))
         painter.drawText(self.rect(), Qt.AlignCenter, self.text())
+
+
+class DragHandle(QPushButton):
+    """Grip handle for repositioning the overlay.
+
+    Long-press (500ms) then drag to move the entire overlay to a new
+    position. Position is persisted to settings on release.
+
+    Visual: medium circular button with three horizontal grip bars
+    (≡), distinct from the arrow nav buttons.
+    """
+
+    long_pressed = Signal()
+    drag_moved = Signal(QPoint)  # Emitted during drag (delta)
+    drag_ended = Signal()        # Emitted when drag finishes
+
+    SIZE = 40
+    LONG_PRESS_MS = 500
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setToolTip("长按拖拽可移动按钮位置")
+
+        # Drag state
+        self._press_timer = QTimer(self)
+        self._press_timer.setSingleShot(True)
+        self._press_timer.timeout.connect(self._on_long_press)
+        self._long_press_active = False
+        self._is_dragging = False
+        self._press_start_pos = QPoint()
+        self._cursor_overridden = False
+
+    def paintEvent(self, event) -> None:
+        """Draw circular grip handle with three horizontal bars."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        s = self.SIZE
+        cx, cy = s / 2, s / 2
+        r = (s - 5) / 2
+
+        # Circle background
+        if self._long_press_active:
+            bg = QColor(50, 50, 50, 210)
+            border = QPen(QColor(255, 255, 255, 190), 2.5)
+            bar_alpha = 240
+        elif self.underMouse():
+            bg = QColor(45, 45, 45, 180)
+            border = QPen(QColor(255, 255, 255, 140), 2)
+            bar_alpha = 190
+        else:
+            bg = QColor(35, 35, 35, 140)
+            border = QPen(QColor(255, 255, 255, 100), 1.8)
+            bar_alpha = 150
+
+        painter.setPen(border)
+        painter.setBrush(bg)
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+
+        # ── Three horizontal grip bars ──
+        bar_w = 14.0
+        bar_h = 3.0
+        bar_gap = 5.0
+        bar_radius = 1.5
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, bar_alpha))
+        for i in range(3):
+            by = cy + (i - 1) * bar_gap
+            painter.drawRoundedRect(
+                QRectF(cx - bar_w / 2, by - bar_h / 2, bar_w, bar_h),
+                bar_radius, bar_radius,
+            )
+
+    # ── Drag event handling ──────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         """Record press position, start long-press timer."""
@@ -137,7 +218,7 @@ class TouchButton(QPushButton):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        """Handle drag movement."""
+        """Emit drag_moved deltas when in drag mode."""
         if self._long_press_active:
             current_pos = event.globalPosition().toPoint()
             delta = current_pos - self._press_start_pos
@@ -149,24 +230,35 @@ class TouchButton(QPushButton):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        """Cancel long-press timer, emit click if not dragging."""
+        """End drag mode, clean up cursor and grab."""
         self._press_timer.stop()
         was_dragging = self._is_dragging
         was_long_press = self._long_press_active
         self._is_dragging = False
         self._long_press_active = False
 
-        if not was_dragging and not was_long_press:
-            # Normal click
-            super().mouseReleaseEvent(event)
+        if was_dragging or was_long_press:
+            try:
+                self.releaseMouse()
+            except Exception:
+                pass
+            if self._cursor_overridden:
+                QApplication.restoreOverrideCursor()
+                self._cursor_overridden = False
+            self.drag_ended.emit()
+            event.accept()
         else:
-            # Was a drag or long press, don't emit clicked
             event.accept()
         self.update()
 
     def _on_long_press(self) -> None:
-        """Long press detected: enter drag mode."""
+        """Long press detected: enter drag mode, grab mouse."""
         self._long_press_active = True
+        self._press_start_pos = QCursor.pos()
+        self.grabMouse()
+        if not self._cursor_overridden:
+            QApplication.setOverrideCursor(Qt.ClosedHandCursor)
+            self._cursor_overridden = True
         self.long_pressed.emit()
         self.update()
 
@@ -315,7 +407,12 @@ class OverlayWindow(QWidget):
 
         # Overall window size depends on button size and layout
         btn_size = self._settings.get("button_size", 80)
-        self.setFixedSize(btn_size * 2 + 40, btn_size + 20)
+        margin = 10   # layout contents margin (left + right)
+        spacing = 12  # layout widget spacing (×2 gaps)
+        self.setFixedSize(
+            btn_size * 2 + DragHandle.SIZE + 2 * margin + 2 * spacing,
+            btn_size + 2 * margin,
+        )
 
     def showEvent(self, event):
         """Apply WS_EX_LAYERED after the native window is created."""
@@ -346,15 +443,18 @@ class OverlayWindow(QWidget):
             # Map to widget-local coordinates
             local_pos = self.mapFromGlobal(QPoint(x, y))
 
-            # Check if position is over a button
+            # Check if position is over a button or drag handle
             if hasattr(self, '_prev_btn') and hasattr(self, '_next_btn'):
                 prev_geo = self._prev_btn.geometry()
                 next_geo = self._next_btn.geometry()
 
                 if prev_geo.contains(local_pos) or next_geo.contains(local_pos):
                     return False, HTCLIENT  # Capture click on buttons
-                elif self._drag_active:
-                    return False, HTCAPTION  # Allow window drag
+
+            if hasattr(self, '_drag_handle'):
+                handle_geo = self._drag_handle.geometry()
+                if handle_geo.contains(local_pos):
+                    return False, HTCLIENT  # Capture click on drag handle
 
             # Pass through to window underneath (PowerPoint)
             return True, HTTRANSPARENT
@@ -382,15 +482,18 @@ class OverlayWindow(QWidget):
             layout.addWidget(self._prev_btn)
             layout.addWidget(self._next_btn)
 
-        # Connect signals
+        # Connect navigation signals
         self._prev_btn.clicked.connect(self.prev_requested.emit)
         self._next_btn.clicked.connect(self.next_requested.emit)
 
-        # Drag support
-        self._prev_btn.drag_moved.connect(self._on_button_drag)
-        self._prev_btn.long_pressed.connect(self._on_long_press_start)
-        self._next_btn.drag_moved.connect(self._on_button_drag)
-        self._next_btn.long_pressed.connect(self._on_long_press_start)
+        # Drag handle (small grip between buttons)
+        self._drag_handle = DragHandle(self)
+        layout.insertWidget(1, self._drag_handle)  # Between prev (idx 0) and next (idx 1)
+
+        # Connect drag signals
+        self._drag_handle.drag_moved.connect(self._on_button_drag)
+        self._drag_handle.long_pressed.connect(self._on_long_press_start)
+        self._drag_handle.drag_ended.connect(self._on_button_drag_end)
 
         self._apply_button_opacity()
 
@@ -426,6 +529,14 @@ class OverlayWindow(QWidget):
         self._drag_active = True
         new_pos = self.pos() + delta
         self.move(new_pos)
+
+    def _on_button_drag_end(self) -> None:
+        """Called when button drag finishes — reset state and save position."""
+        self._drag_active = False
+        pos = self.pos()
+        SettingsManager.update(
+            "overlay_position", {"x": pos.x(), "y": pos.y()}
+        )
 
     def _on_long_press_start(self) -> None:
         """Visual feedback when long press detected."""
@@ -478,9 +589,12 @@ class OverlayWindow(QWidget):
         btn_size = self._settings.get("button_size", 80)
         hand_mode = self._settings.get("hand_mode", "right")
         btn_spacing = max(8, int(btn_size * 0.15))
-        # Window padding
         pad = 10
-        self.setFixedSize(btn_size * 2 + 2 * pad + btn_spacing, btn_size + 2 * pad)
+        # Two buttons + drag handle + two spacings + padding
+        self.setFixedSize(
+            btn_size * 2 + DragHandle.SIZE + 2 * pad + btn_spacing + 12,
+            btn_size + 2 * pad,
+        )
 
         self._create_buttons()
         self._apply_position()
