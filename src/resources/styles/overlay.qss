@@ -1,0 +1,52 @@
+/* PPT Touch Controller Overlay Styles */
+
+TouchButton {
+    background: transparent;
+    border: none;
+}
+
+SettingsDialog {
+    background-color: #2D2D2D;
+    border: 2px solid #555555;
+    border-radius: 10px;
+    color: #FFFFFF;
+}
+
+SettingsDialog QLabel {
+    color: #FFFFFF;
+    font-size: 14px;
+}
+
+SettingsDialog QSlider::groove:horizontal {
+    height: 8px;
+    background: #555555;
+    border-radius: 4px;
+}
+
+SettingsDialog QSlider::handle:horizontal {
+    width: 24px;
+    height: 24px;
+    margin: -8px 0;
+    background: #0078D4;
+    border-radius: 12px;
+}
+
+SettingsDialog QComboBox {
+    background: #444444;
+    color: #FFFFFF;
+    border: 1px solid #666666;
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+
+SettingsDialog QPushButton {
+    background: #444444;
+    color: #FFFFFF;
+    border: 1px solid #666666;
+    padding: 6px 16px;
+    border-radius: 4px;
+}
+
+SettingsDialog QPushButton:hover {
+    background: #555555;
+}
