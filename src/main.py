@@ -21,7 +21,7 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import (
-    Qt, QTimer, QThread, QSharedMemory, QDataStream,
+    Qt, QTimer, QSharedMemory, QDataStream,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -80,7 +80,6 @@ class PPTTouchApp(QApplication):
         self._ipc_server = None
 
         # Core components
-        self._com_thread = None
         self._com_worker = None
         self._overlay = None
         self._status_timer = None
@@ -181,38 +180,38 @@ class PPTTouchApp(QApplication):
         # Shut down previous slideshow if any
         self._cleanup_slideshow()
 
+        # ── Single-threaded architecture ──
+        # Initialize COM on the main thread (STA required by PowerPoint).
+        # PPTController handles CoInitializeEx internally.
+        self._com_worker = PPTController()
+
+        # Connect signals (same thread, no queuing needed)
+        self._com_worker.slideshow_started.connect(
+            self._on_slideshow_started
+        )
+        self._com_worker.slideshow_ended.connect(
+            self._on_slideshow_ended
+        )
+        self._com_worker.error_occurred.connect(
+            self._on_error
+        )
+
         # Create overlay window
         settings = SettingsManager.load()
         self._overlay = OverlayWindow(settings)
-        self._overlay.show()
 
-        # Create COM worker and thread
-        self._com_thread = QThread(self)
-        self._com_worker = PPTController()
-        self._com_worker.moveToThread(self._com_thread)
-
-        # Connect signals (cross-thread via Qt.QueuedConnection)
+        # Connect overlay buttons → COM worker (same thread)
         self._overlay.next_requested.connect(
-            self._com_worker.next_step, Qt.QueuedConnection
+            self._com_worker.next_step
         )
         self._overlay.prev_requested.connect(
-            self._com_worker.prev_step, Qt.QueuedConnection
-        )
-        self._com_worker.slideshow_started.connect(
-            self._on_slideshow_started, Qt.QueuedConnection
-        )
-        self._com_worker.slideshow_ended.connect(
-            self._on_slideshow_ended, Qt.QueuedConnection
-        )
-        self._com_worker.error_occurred.connect(
-            self._on_error, Qt.QueuedConnection
+            self._com_worker.prev_step
         )
 
-        # Start COM thread
-        self._com_thread.started.connect(
-            lambda fp=file_path: self._com_worker.open_and_start(fp)
-        )
-        self._com_thread.start()
+        self._overlay.show()
+
+        # Open PowerPoint and start slideshow (blocking, but fast)
+        self._com_worker.open_and_start(file_path)
         self._slideshow_active = True
 
         # Start polling slideshow status
@@ -249,22 +248,21 @@ class PPTTouchApp(QApplication):
         self._cleanup_slideshow()
 
     def _poll_slideshow_status(self) -> None:
-        """Periodically check if slideshow thread is still running."""
+        """Periodically check if slideshow is still running."""
         if not self._slideshow_active:
-            # Already ended, clean up
             self._cleanup_slideshow()
             return
 
-        if self._com_thread and not self._com_thread.isRunning():
-            # Thread stopped (slideshow ended or crashed)
-            logger.info("COM thread stopped, cleaning up")
+        # Check COM worker status
+        if self._com_worker and not self._com_worker.check_status():
+            logger.info("Slideshow no longer running, cleaning up")
             self._slideshow_active = False
             if self._overlay:
                 self._overlay.hide()
             self._cleanup_slideshow()
 
     def _cleanup_slideshow(self) -> None:
-        """Stop slideshow monitoring, clean up overlay and COM thread."""
+        """Stop slideshow monitoring, clean up overlay and COM worker."""
         self._slideshow_active = False
 
         # Stop timer
@@ -291,16 +289,6 @@ class PPTTouchApp(QApplication):
                 pass
             self._com_worker.deleteLater()
             self._com_worker = None
-
-        # Stop COM thread
-        if self._com_thread:
-            try:
-                self._com_thread.quit()
-                self._com_thread.wait(3000)
-            except Exception:
-                pass
-            self._com_thread.deleteLater()
-            self._com_thread = None
 
     def _handle_no_powerpoint(self, file_path: str) -> None:
         """Fallback when PowerPoint is not installed."""
@@ -370,10 +358,14 @@ def main():
         file_path = " ".join(sys.argv[1:])
 
     # High-DPI support for touch screens
-    if hasattr(Qt, "AA_EnableHighDpiScaling"):
-        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
-        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    # AA_EnableHighDpiScaling / AA_UseHighDpiPixmaps are deprecated in Qt 6
+    # — high-DPI is enabled by default. Keeping for Qt 5 compatibility.
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+    except AttributeError:
+        pass
 
     app = PPTTouchApp(sys.argv)
 

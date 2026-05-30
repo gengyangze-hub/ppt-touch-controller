@@ -16,7 +16,7 @@ Key Windows API tricks:
 import ctypes
 from ctypes import wintypes
 from PySide6.QtCore import (
-    Qt, QTimer, QPoint, QSize, Signal, Property, QEasingCurve,
+    Qt, QTimer, QPoint, QSize, Signal, QEasingCurve,
     QPropertyAnimation,
 )
 from PySide6.QtGui import (
@@ -35,7 +35,6 @@ from settings_manager import SettingsManager
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
-LWA_ALPHA = 0x00000002
 GWL_EXSTYLE = -20
 
 WM_NCHITTEST = 0x0084
@@ -43,28 +42,28 @@ HTCLIENT = 1
 HTTRANSPARENT = -1
 HTCAPTION = 2
 
-# SetWindowLongPtr - use the appropriate one for 64-bit
+# Window style helpers
 SetWindowLongPtrW = ctypes.windll.user32.SetWindowLongPtrW
 GetWindowLongPtrW = ctypes.windll.user32.GetWindowLongPtrW
-SetLayeredWindowAttributes = ctypes.windll.user32.SetLayeredWindowAttributes
 
-# Define proper argument types
-# LONG_PTR = c_longlong on 64-bit, c_long on 32-bit
 LONG_PTR = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
-
 SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, LONG_PTR]
 SetWindowLongPtrW.restype = LONG_PTR
 GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
 GetWindowLongPtrW.restype = LONG_PTR
 
-# WNDPROC callback type
-WNDPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_longlong,  # LRESULT
-    ctypes.c_longlong,  # HWND
-    ctypes.c_uint,      # UINT (msg)
-    ctypes.c_uint64,     # WPARAM
-    ctypes.c_longlong,   # LPARAM
-)
+
+# MSG structure for nativeEvent
+class MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("message", wintypes.UINT),
+        ("wParam", wintypes.WPARAM),
+        ("lParam", wintypes.LPARAM),
+        ("time", wintypes.DWORD),
+        ("pt_x", ctypes.c_long),
+        ("pt_y", ctypes.c_long),
+    ]
 
 
 class TouchButton(QPushButton):
@@ -283,9 +282,9 @@ class OverlayWindow(QWidget):
     """Transparent overlay floating above PowerPoint slideshow.
 
     Provides large touch-friendly prev/next buttons. Background is
-    invisible and click-through (via WM_NCHITTEST). Buttons capture
-    touches. Long-press a button to drag the entire overlay to a new
-    position.
+    invisible and click-through (via WM_NCHITTEST handled in nativeEvent).
+    Buttons capture touches. Long-press a button to drag the entire
+    overlay to a new position.
     """
 
     next_requested = Signal()
@@ -296,12 +295,9 @@ class OverlayWindow(QWidget):
         super().__init__()
         self._settings = settings or SettingsManager.load()
         self._drag_active = False
-        self._original_wndproc = None
-        self._wndproc_ref = None  # Keep reference to prevent GC
 
         self._setup_window()
         self._create_buttons()
-        self._install_clickthrough()
         self._apply_position()
         self._apply_style()
 
@@ -320,6 +316,50 @@ class OverlayWindow(QWidget):
         # Overall window size depends on button size and layout
         btn_size = self._settings.get("button_size", 80)
         self.setFixedSize(btn_size * 2 + 40, btn_size + 20)
+
+    def showEvent(self, event):
+        """Apply WS_EX_LAYERED after the native window is created."""
+        super().showEvent(event)
+        hwnd = int(self.winId())
+        ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+        ex_style |= WS_EX_LAYERED | WS_EX_TOOLWINDOW
+        # Ensure WS_EX_TRANSPARENT is NOT set so buttons can receive clicks
+        ex_style &= ~WS_EX_TRANSPARENT
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style)
+
+    def nativeEvent(self, eventType, message):
+        """Handle WM_NCHITTEST to implement click-through.
+
+        Qt's native event handler — no ctypes WNDPROC subclassing needed.
+        Returns HTTRANSPARENT for non-button areas (pass-through to
+        PowerPoint), HTCLIENT for button areas (capture clicks).
+        """
+        msg = ctypes.cast(
+            int(message), ctypes.POINTER(MSG)
+        ).contents
+
+        if msg.message == WM_NCHITTEST:
+            # Extract screen coordinates from lParam
+            x = msg.lParam & 0xFFFF
+            y = (msg.lParam >> 16) & 0xFFFF
+
+            # Map to widget-local coordinates
+            local_pos = self.mapFromGlobal(QPoint(x, y))
+
+            # Check if position is over a button
+            if hasattr(self, '_prev_btn') and hasattr(self, '_next_btn'):
+                prev_geo = self._prev_btn.geometry()
+                next_geo = self._next_btn.geometry()
+
+                if prev_geo.contains(local_pos) or next_geo.contains(local_pos):
+                    return False, HTCLIENT  # Capture click on buttons
+                elif self._drag_active:
+                    return False, HTCAPTION  # Allow window drag
+
+            # Pass through to window underneath (PowerPoint)
+            return True, HTTRANSPARENT
+
+        return False, 0  # Let Qt handle all other messages
 
     def _create_buttons(self) -> None:
         """Create prev/next buttons based on hand mode."""
@@ -360,59 +400,6 @@ class OverlayWindow(QWidget):
         self._prev_btn.set_opacity(opacity)
         self._next_btn.set_opacity(opacity)
 
-    def _install_clickthrough(self) -> None:
-        """Install WM_NCHITTEST subclass to make non-button areas pass clicks through.
-
-        Returns HTCLIENT when the mouse is over a button (capture the click),
-        HTTRANSPARENT otherwise (pass through to PowerPoint underneath).
-        During drag, returns HTCAPTION to allow window movement.
-        """
-        hwnd = int(self.winId())
-
-        # Add WS_EX_LAYERED for per-pixel alpha (Qt.WA_TranslucentBackground)
-        # Do NOT add WS_EX_TRANSPARENT - it blocks ALL mouse input
-        # Instead, we use WM_NCHITTEST to return HTTRANSPARENT for non-button areas
-        ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
-        ex_style |= WS_EX_LAYERED | WS_EX_TOOLWINDOW
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style)
-
-        # Store reference to self for the callback
-        self_ref = self
-
-        @WNDPROC
-        def wnd_proc(hwnd, msg, wparam, lparam):
-            if msg == WM_NCHITTEST:
-                # Extract screen coordinates from lparam
-                x = lparam & 0xFFFF
-                y = (lparam >> 16) & 0xFFFF
-
-                # Map to widget coordinates
-                local_pos = self_ref.mapFromGlobal(QPoint(x, y))
-
-                # Check if position is over a button
-                prev_geo = self_ref._prev_btn.geometry()
-                next_geo = self_ref._next_btn.geometry()
-
-                if prev_geo.contains(local_pos) or next_geo.contains(local_pos):
-                    return HTCLIENT  # Capture click on buttons
-                elif self_ref._drag_active:
-                    return HTCAPTION  # Allow window drag
-                else:
-                    return HTTRANSPARENT  # Pass through to PowerPoint
-
-            # Call the original window procedure for all other messages
-            return ctypes.windll.user32.CallWindowProcW(
-                self_ref._original_wndproc, hwnd, msg, wparam, lparam
-            )
-
-        # Keep reference to prevent garbage collection
-        self._wndproc_ref = wnd_proc
-
-        # Subclass the window
-        self._original_wndproc = SetWindowLongPtrW(
-            hwnd, -4, ctypes.cast(wnd_proc, ctypes.c_void_p).value  # GWLP_WNDPROC = -4
-        )
-
     def _apply_position(self) -> None:
         """Position the overlay window based on saved settings or auto-detect."""
         pos = self._settings.get("overlay_position", {})
@@ -431,7 +418,7 @@ class OverlayWindow(QWidget):
                 self.move(x, y)
 
     def _apply_style(self) -> None:
-        """Apply stylesheet from QSS file."""
+        """Apply stylesheet — transparent for click-through."""
         self.setStyleSheet("background: transparent;")
 
     def _on_button_drag(self, delta: QPoint) -> None:

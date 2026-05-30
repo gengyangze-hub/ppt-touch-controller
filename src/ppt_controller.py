@@ -7,7 +7,7 @@ runs in Multi-Threaded Apartment.
 
 import time
 import logging
-from PySide6.QtCore import QObject, Signal, QMutex, QMutexLocker
+from PySide6.QtCore import QObject, Signal, QMutex, QMutexLocker, Slot
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +37,21 @@ class PPTController(QObject):
         super().__init__(parent)
         self._app = None
         self._presentation = None
-        self._slideshow_view = None
         self._mutex = QMutex()
         self._running = False
 
+    def _get_slideshow_view(self):
+        """Get the active slideshow view dynamically.
+
+        Accessing the view fresh each time avoids stale COM dispatch
+        references. Returns None if no slideshow is running.
+        """
+        try:
+            return self._app.SlideShowWindows(1).View
+        except Exception:
+            return None
+
+    @Slot(str)
     def open_and_start(self, file_path: str) -> None:
         """Open a PPTX file and start slideshow in fullscreen.
 
@@ -54,14 +65,20 @@ class PPTController(QObject):
                 # Initialize COM for this thread (STA mode)
                 pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
 
-                # Try to attach to existing PowerPoint instance first
+                # Use EnsureDispatch for early-bound COM proxy (static
+                # dispatch — resolves all methods/properties from the
+                # PowerPoint type library).
                 try:
                     self._app = win32com.client.GetActiveObject(
                         "PowerPoint.Application"
                     )
+                    # Wrap as EnsureDispatch to get static proxy
+                    self._app = win32com.client.gencache.EnsureDispatch(
+                        self._app
+                    )
                     logger.info("Attached to existing PowerPoint instance")
                 except Exception:
-                    self._app = win32com.client.Dispatch(
+                    self._app = win32com.client.gencache.EnsureDispatch(
                         "PowerPoint.Application"
                     )
                     logger.info("Created new PowerPoint instance")
@@ -78,7 +95,7 @@ class PPTController(QObject):
                 # Start slideshow (fullscreen)
                 slideshow_settings = self._presentation.SlideShowSettings
                 slideshow = slideshow_settings.Run()
-                self._slideshow_view = slideshow.View
+                # Don't cache .View — access it fresh each time
                 self._running = True
 
                 logger.info("Slideshow started")
@@ -90,38 +107,50 @@ class PPTController(QObject):
                 self._running = False
                 self.error_occurred.emit(msg)
 
+    @Slot()
     def next_step(self) -> None:
         """Advance to next animation step or slide."""
         with QMutexLocker(self._mutex):
             if not self._running:
+                logger.warning("next_step called but slideshow not running")
                 return
             try:
-                if self._slideshow_view:
-                    self._slideshow_view.Next()
+                view = self._get_slideshow_view()
+                if view:
+                    logger.info("Next: advancing")
+                    view.Next()
+                    logger.info("Next: done")
             except Exception as e:
-                logger.debug(f"Next failed (slideshow may have ended): {e}")
+                logger.error(f"Next failed: {e}", exc_info=True)
                 self._check_if_ended()
 
+    @Slot()
     def prev_step(self) -> None:
         """Go back to previous animation step or slide."""
         with QMutexLocker(self._mutex):
             if not self._running:
+                logger.warning("prev_step called but slideshow not running")
                 return
             try:
-                if self._slideshow_view:
-                    self._slideshow_view.Previous()
+                view = self._get_slideshow_view()
+                if view:
+                    logger.info("Previous: going back")
+                    view.Previous()
+                    logger.info("Previous: done")
             except Exception as e:
-                logger.debug(f"Previous failed: {e}")
+                logger.error(f"Previous failed: {e}", exc_info=True)
                 self._check_if_ended()
 
+    @Slot(int)
     def goto_slide(self, index: int) -> None:
         """Jump to a specific slide (1-indexed, skips animations)."""
         with QMutexLocker(self._mutex):
             if not self._running:
                 return
             try:
-                if self._slideshow_view:
-                    self._slideshow_view.GotoSlide(index)
+                view = self._get_slideshow_view()
+                if view:
+                    view.GotoSlide(index)
             except Exception as e:
                 logger.debug(f"GotoSlide failed: {e}")
 
@@ -153,19 +182,21 @@ class PPTController(QObject):
             self.slideshow_ended.emit()
             self.status_changed.emit(False)
 
+    @Slot()
     def exit_slideshow(self) -> None:
         """Exit slideshow and close presentation."""
         with QMutexLocker(self._mutex):
             try:
-                if self._slideshow_view:
-                    self._slideshow_view.Exit()
-                    self._slideshow_view = None
+                view = self._get_slideshow_view()
+                if view:
+                    view.Exit()
             except Exception:
                 pass
             self._running = False
             self.slideshow_ended.emit()
             self.status_changed.emit(False)
 
+    @Slot()
     def shutdown(self) -> None:
         """Exit slideshow, close presentation, quit PowerPoint."""
         with QMutexLocker(self._mutex):
@@ -175,9 +206,9 @@ class PPTController(QObject):
     def _do_cleanup(self) -> None:
         """Internal cleanup without mutex (caller must hold lock)."""
         try:
-            if self._slideshow_view:
-                self._slideshow_view.Exit()
-                self._slideshow_view = None
+            view = self._get_slideshow_view()
+            if view:
+                view.Exit()
         except Exception:
             pass
         try:
@@ -197,10 +228,12 @@ class PPTController(QObject):
         """Get current slide number and total count."""
         with QMutexLocker(self._mutex):
             try:
-                if self._running and self._slideshow_view:
-                    current = self._slideshow_view.CurrentShowPosition
-                    total = self._presentation.Slides.Count
-                    return {"current": current, "total": total}
+                if self._running:
+                    view = self._get_slideshow_view()
+                    if view:
+                        current = view.CurrentShowPosition
+                        total = self._presentation.Slides.Count
+                        return {"current": current, "total": total}
             except Exception:
                 pass
         return {"current": 0, "total": 0}
