@@ -17,6 +17,8 @@ The application:
 
 import sys
 import os
+import atexit
+import subprocess
 import ctypes
 from ctypes import wintypes
 import logging
@@ -50,6 +52,7 @@ CloseHandle.restype = wintypes.BOOL
 ERROR_ALREADY_EXISTS = 183
 
 MUTEX_NAME = "Local\\PPTTouchController_SingleInstance_v1"
+PID_FILE = Path(os.environ.get("TEMP", "")) / "PPTTouchController.pid"
 
 # Configure logging
 logging.basicConfig(
@@ -111,6 +114,7 @@ class PPTTouchApp(QApplication):
 
         # Cleanup on exit (direct cleanup — no deleteLater on shutdown)
         self.aboutToQuit.connect(self._cleanup_on_quit)
+        atexit.register(PPTTouchApp._remove_pid_file)
 
     def try_become_primary(self) -> bool:
         """Attempt to become the primary instance.
@@ -130,16 +134,89 @@ class PPTTouchApp(QApplication):
 
         self._mutex_handle = handle
         if GetLastError() == ERROR_ALREADY_EXISTS:
-            # Another instance holds the mutex
-            self._is_primary = False
-            logger.info("Another instance is already running")
-            return False
+            # Mutex exists — another instance may be running.
+            # Try IPC to check if it's alive.
+            if self._check_primary_alive():
+                # Genuine second instance — forward and exit
+                self._is_primary = False
+                logger.info("Another instance is already running (IPC confirmed)")
+                return False
+            else:
+                # Zombie: mutex held but primary is unresponsive
+                logger.warning("Existing mutex but IPC failed — zombie detected")
+                if self._ask_force_restart():
+                    self._kill_zombie()
+                    # Retry: close the existing mutex handle, then create fresh
+                    CloseHandle(handle)
+                    handle = CreateMutexW(None, False, MUTEX_NAME)
+                    self._mutex_handle = handle
+                    self._is_primary = True
+                    self._write_pid_file()
+                    self._start_ipc_server()
+                    logger.info("Primary instance started (forced after zombie cleanup)")
+                    return True
+                else:
+                    self._is_primary = False
+                    return False
 
         # We created the mutex — we are the primary
         self._is_primary = True
+        self._write_pid_file()
         self._start_ipc_server()
         logger.info("Primary instance started")
         return True
+
+    def _check_primary_alive(self) -> bool:
+        """Check if the existing primary instance is responsive via IPC."""
+        socket = QLocalSocket()
+        socket.connectToServer(IPC_SERVER_NAME)
+        alive = socket.waitForConnected(1500)
+        if alive:
+            socket.disconnectFromServer()
+        return alive
+
+    def _ask_force_restart(self) -> bool:
+        """Show dialog asking if user wants to kill the unresponsive instance."""
+        # Must be called before QApplication.exec(), so use a raw QMessageBox
+        reply = QMessageBox.question(
+            None,
+            "程序已在运行",
+            "检测到程序已有实例在运行，但该实例无响应。\n\n"
+            "是否终止旧实例并重新启动？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        return reply == QMessageBox.Yes
+
+    def _kill_zombie(self) -> None:
+        """Kill the unresponsive primary process by its saved PID."""
+        try:
+            if PID_FILE.exists():
+                pid_text = PID_FILE.read_text().strip()
+                pid = int(pid_text)
+                subprocess.run(
+                    ['taskkill', '/F', '/PID', str(pid)],
+                    capture_output=True,
+                )
+                PID_FILE.unlink(missing_ok=True)
+                logger.info(f"Killed zombie process PID {pid}")
+        except Exception as e:
+            logger.warning(f"Failed to kill zombie: {e}")
+
+    def _write_pid_file(self) -> None:
+        """Save current process PID for zombie detection by future instances."""
+        try:
+            PID_FILE.write_text(str(os.getpid()))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _remove_pid_file() -> None:
+        """Clean up PID file on normal exit."""
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _start_ipc_server(self) -> None:
         """Start local server to receive file paths from secondary instances."""
