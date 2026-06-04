@@ -1,13 +1,48 @@
 @echo off
-REM PPT Touch Controller Launcher
-REM Use this to associate .pptx files: right-click .pptx → Open with → choose this .bat
-REM Or run: python src/file_associator.py register
+REM PPT Touch Controller Launcher - v2
 
-set PYTHON="C:\Users\Administrator\AppData\Local\Programs\Python\Python314\python.exe"
 set SCRIPT=%~dp0src\main.py
+set PYTHON=
 
-if exist %PYTHON% (
-    %PYTHON% %SCRIPT% %1
-) else (
-    python %SCRIPT% %1
+REM Try python from PATH first
+where python >nul 2>&1
+if %ERRORLEVEL% EQU 0 set PYTHON=python && goto :found
+
+where python3 >nul 2>&1
+if %ERRORLEVEL% EQU 0 set PYTHON=python3 && goto :found
+
+REM Scan common install dirs
+for %%d in (
+    "%LOCALAPPDATA%\Programs\Python\Python314"
+    "%LOCALAPPDATA%\Programs\Python\Python313"
+    "%LOCALAPPDATA%\Programs\Python\Python312"
+    "%LOCALAPPDATA%\Programs\Python\Python311"
+    "%LOCALAPPDATA%\Programs\Python\Python310"
+    "%LOCALAPPDATA%\Programs\Python\Python39"
+    "C:\Program Files\Python314"
+    "C:\Program Files\Python313"
+    "C:\Python314"
+    "C:\Python313"
+) do (
+    if exist "%%~d\python.exe" set PYTHON="%%~d\python.exe" && goto :found
+)
+
+REM Python not found
+echo ERROR: Python not found.
+echo Please install Python 3.9+ from https://www.python.org/downloads/
+echo Make sure to check "Add Python to PATH" during installation.
+pause
+exit /b 1
+
+:found
+echo Starting PPT Touch Controller...
+echo Python: %PYTHON%
+echo.
+
+%PYTHON% %SCRIPT% %*
+
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo Program exited with error code: %ERRORLEVEL%
+    pause
 )
