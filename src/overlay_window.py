@@ -588,12 +588,11 @@ class OverlayWindow(QWidget):
 
         btn_size = self._settings.get("button_size", 80)
         hand_mode = self._settings.get("hand_mode", "right")
-        btn_spacing = max(8, int(btn_size * 0.15))
-        pad = 10
-        # Two buttons + drag handle + two spacings + padding
+        margin = 10
+        spacing = 12
         self.setFixedSize(
-            btn_size * 2 + DragHandle.SIZE + 2 * pad + btn_spacing + 12,
-            btn_size + 2 * pad,
+            btn_size * 2 + DragHandle.SIZE + 2 * margin + 2 * spacing,
+            btn_size + 2 * margin,
         )
 
         self._create_buttons()

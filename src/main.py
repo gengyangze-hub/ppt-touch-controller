@@ -17,11 +17,13 @@ The application:
 
 import sys
 import os
+import ctypes
+from ctypes import wintypes
 import logging
 from pathlib import Path
 
 from PySide6.QtCore import (
-    Qt, QTimer, QSharedMemory, QDataStream,
+    Qt, QTimer, QDataStream,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -33,6 +35,22 @@ from settings_manager import SettingsManager
 from ppt_controller import PPTController
 from overlay_window import OverlayWindow
 
+# ── Windows single-instance mutex ──────────────────────────────────
+# A named kernel mutex is the most reliable single-instance lock on
+# Windows: the OS auto-releases it when the owning process terminates,
+# even on crash.  No stale-segment issues like QSharedMemory.
+kernel32 = ctypes.windll.kernel32
+CreateMutexW = kernel32.CreateMutexW
+CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+CreateMutexW.restype = wintypes.HANDLE
+GetLastError = kernel32.GetLastError
+CloseHandle = kernel32.CloseHandle
+CloseHandle.argtypes = [wintypes.HANDLE]
+CloseHandle.restype = wintypes.BOOL
+ERROR_ALREADY_EXISTS = 183
+
+MUTEX_NAME = "Local\\PPTTouchController_SingleInstance_v1"
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -40,8 +58,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PPTouchController")
 
-# Single-instance identifiers
-SHARED_MEMORY_KEY = "PPTTouchController_Instance_v1"
+# Single-instance identifier (QLocalServer-based, no stale-segment issues)
 IPC_SERVER_NAME = "PPTTouchController_IPC_v1"
 
 
@@ -66,7 +83,12 @@ def detect_powerpoint() -> bool:
 
 
 class PPTTouchApp(QApplication):
-    """Main application with single-instance enforcement."""
+    """Main application with single-instance enforcement.
+
+    Uses a Windows named mutex for single-instance detection — the OS
+    auto-releases the mutex when the process exits, even on crash, so
+    there are no stale-lock issues.
+    """
 
     def __init__(self, argv):
         super().__init__(argv)
@@ -74,8 +96,8 @@ class PPTTouchApp(QApplication):
         self.setApplicationVersion("1.0.0")
         self.setOrganizationName("PPTTouchController")
 
-        # Single-instance check
-        self._memory = QSharedMemory(SHARED_MEMORY_KEY)
+        # Single-instance via Windows named mutex
+        self._mutex_handle = None
         self._is_primary = False
         self._ipc_server = None
 
@@ -85,19 +107,49 @@ class PPTTouchApp(QApplication):
         self._status_timer = None
         self._file_path = None
         self._slideshow_active = False
+        self._fallback_viewer = None
 
-        # Cleanup on exit
-        self.aboutToQuit.connect(self._cleanup_slideshow)
+        # Cleanup on exit (direct cleanup — no deleteLater on shutdown)
+        self.aboutToQuit.connect(self._cleanup_on_quit)
 
     def try_become_primary(self) -> bool:
-        """Attempt to become the primary instance."""
-        if self._memory.create(1):
-            self._is_primary = True
-            self._start_ipc_server()
-            return True
-        else:
+        """Attempt to become the primary instance.
+
+        Creates a Windows named mutex.  If the mutex already exists,
+        another instance is running and we become a secondary (forwarding
+        the file path to the primary).
+
+        The OS automatically destroys the mutex when the process exits,
+        so stale locks from crashes are impossible.
+        """
+        handle = CreateMutexW(None, False, MUTEX_NAME)
+        if handle == 0:
+            logger.error("CreateMutexW failed — cannot determine instance status")
             self._is_primary = False
             return False
+
+        self._mutex_handle = handle
+        if GetLastError() == ERROR_ALREADY_EXISTS:
+            # Another instance holds the mutex
+            self._is_primary = False
+            logger.info("Another instance is already running")
+            return False
+
+        # We created the mutex — we are the primary
+        self._is_primary = True
+        self._start_ipc_server()
+        logger.info("Primary instance started")
+        return True
+
+    def _start_ipc_server(self) -> None:
+        """Start local server to receive file paths from secondary instances."""
+        QLocalServer.removeServer(IPC_SERVER_NAME)
+        self._ipc_server = QLocalServer(self)
+        if self._ipc_server.listen(IPC_SERVER_NAME):
+            self._ipc_server.newConnection.connect(self._on_ipc_connection)
+            logger.info("IPC server listening")
+        else:
+            logger.warning(f"IPC server failed to listen: {self._ipc_server.errorString()}")
 
     def send_to_primary(self, file_path: str) -> bool:
         """Send a file path to the already-running primary instance."""
@@ -116,14 +168,6 @@ class PPTTouchApp(QApplication):
         else:
             logger.warning("Failed to connect to primary instance")
             return False
-
-    def _start_ipc_server(self) -> None:
-        """Start local server to receive file paths from secondary instances."""
-        self._ipc_server = QLocalServer(self)
-        QLocalServer.removeServer(IPC_SERVER_NAME)
-        if self._ipc_server.listen(IPC_SERVER_NAME):
-            self._ipc_server.newConnection.connect(self._on_ipc_connection)
-            logger.info("IPC server started")
 
     def _on_ipc_connection(self) -> None:
         """Handle incoming connection from a secondary instance."""
@@ -288,6 +332,33 @@ class PPTTouchApp(QApplication):
             except Exception:
                 pass
             self._com_worker.deleteLater()
+            self._com_worker = None
+
+    def _cleanup_on_quit(self) -> None:
+        """Direct cleanup for application shutdown (aboutToQuit).
+
+        Avoids deleteLater() since the event loop is winding down and
+        deferred deletions will never be processed.
+        """
+        self._slideshow_active = False
+
+        if self._status_timer:
+            self._status_timer.stop()
+            self._status_timer = None
+
+        if self._overlay:
+            try:
+                self._overlay.save_position()
+            except Exception:
+                pass
+            self._overlay.hide()
+            self._overlay = None
+
+        if self._com_worker:
+            try:
+                self._com_worker.shutdown()
+            except Exception:
+                pass
             self._com_worker = None
 
     def _handle_no_powerpoint(self, file_path: str) -> None:
