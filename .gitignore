@@ -24,3 +24,6 @@ Thumbs.db
 
 # Local settings
 *.local.*
+
+# Conversation logs
+conversation-*.txt

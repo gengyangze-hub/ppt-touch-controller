@@ -323,10 +323,10 @@ class PPTTouchApp(QApplication):
 
         # Connect overlay buttons → COM worker (same thread)
         self._overlay.next_requested.connect(
-            self._com_worker.next_step
+            self._on_overlay_next
         )
         self._overlay.prev_requested.connect(
-            self._com_worker.prev_step
+            self._on_overlay_prev
         )
 
         self._overlay.show()
@@ -341,6 +341,16 @@ class PPTTouchApp(QApplication):
         self._status_timer.start(500)
 
         logger.info(f"Opening file: {file_path}")
+
+    def _on_overlay_next(self) -> None:
+        """Forward overlay next signal to COM worker with logging."""
+        logger.info("Overlay: next requested → forwarding to PPTController")
+        self._com_worker.next_step()
+
+    def _on_overlay_prev(self) -> None:
+        """Forward overlay prev signal to COM worker with logging."""
+        logger.info("Overlay: prev requested → forwarding to PPTController")
+        self._com_worker.prev_step()
 
     def _on_slideshow_started(self) -> None:
         """Called when PowerPoint slideshow has started."""

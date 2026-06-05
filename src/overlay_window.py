@@ -13,6 +13,7 @@ Key Windows API tricks:
 - Long-press detection: 500ms hold → drag mode to reposition buttons
 """
 
+import logging
 import ctypes
 from ctypes import wintypes
 from PySide6.QtCore import (
@@ -31,6 +32,8 @@ from PySide6.QtWidgets import (
 )
 
 from settings_manager import SettingsManager
+
+logger = logging.getLogger("OverlayWindow")
 
 # Windows API constants
 WS_EX_LAYERED = 0x00080000
@@ -449,12 +452,14 @@ class OverlayWindow(QWidget):
                 next_geo = self._next_btn.geometry()
 
                 if prev_geo.contains(local_pos) or next_geo.contains(local_pos):
-                    return False, HTCLIENT  # Capture click on buttons
+                    logger.debug(f"WM_NCHITTEST: HTCLIENT (button area) at ({x},{y})")
+                    return True, HTCLIENT  # Capture click on buttons
 
             if hasattr(self, '_drag_handle'):
                 handle_geo = self._drag_handle.geometry()
                 if handle_geo.contains(local_pos):
-                    return False, HTCLIENT  # Capture click on drag handle
+                    logger.debug(f"WM_NCHITTEST: HTCLIENT (drag handle) at ({x},{y})")
+                    return True, HTCLIENT  # Capture click on drag handle
 
             # Pass through to window underneath (PowerPoint)
             return True, HTTRANSPARENT
@@ -482,9 +487,9 @@ class OverlayWindow(QWidget):
             layout.addWidget(self._prev_btn)
             layout.addWidget(self._next_btn)
 
-        # Connect navigation signals
-        self._prev_btn.clicked.connect(self.prev_requested.emit)
-        self._next_btn.clicked.connect(self.next_requested.emit)
+        # Connect navigation signals with logging
+        self._prev_btn.clicked.connect(self._on_prev_clicked)
+        self._next_btn.clicked.connect(self._on_next_clicked)
 
         # Drag handle (small grip between buttons)
         self._drag_handle = DragHandle(self)
@@ -523,6 +528,16 @@ class OverlayWindow(QWidget):
     def _apply_style(self) -> None:
         """Apply stylesheet — transparent for click-through."""
         self.setStyleSheet("background: transparent;")
+
+    def _on_prev_clicked(self) -> None:
+        """Handle prev button click with logging for remote debugging."""
+        logger.info("PREV button clicked — emitting prev_requested signal")
+        self.prev_requested.emit()
+
+    def _on_next_clicked(self) -> None:
+        """Handle next button click with logging for remote debugging."""
+        logger.info("NEXT button clicked — emitting next_requested signal")
+        self.next_requested.emit()
 
     def _on_button_drag(self, delta: QPoint) -> None:
         """Move the entire overlay window when a button is dragged."""
